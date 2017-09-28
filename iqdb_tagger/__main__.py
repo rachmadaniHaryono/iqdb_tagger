@@ -8,6 +8,8 @@ import click
 import mechanicalsoup
 import requests
 import structlog
+from bs4 import BeautifulSoup
+from requests_futures.sessions import FuturesSession
 
 from iqdb_tagger import models
 from iqdb_tagger.__init__ import db_version
@@ -123,9 +125,52 @@ def get_tags(match_result, browser=None, scraper=None):
         log.debug('No tags found.')
 
 
+def get_tags_with_async(match_results, browser=None, scraper=None, session=None):
+    """Get tags with requests futures."""
+    # compatibility
+    br = browser
+    if session is None:
+        log.error('Require session.')
+        return match_results
+    if br is None:
+        br = mechanicalsoup.StatefulBrowser(soup_config={'features': 'lxml'})
+        br.raise_on_404 = True
+    if scraper is None:
+        scraper = cfscrape.CloudflareScraper()
+
+    result = []
+    page_set = []
+    filtered_hosts = ['anime-pictures.net', 'www.theanimegallery.com']
+    for result_dict in match_results:
+        url = result_dict['url']
+        from urllib.parse import urlparse
+        if urlparse(url).netloc in filtered_hosts:
+            log.debug(
+                'URL in filtered hosts, no tag fetched', url=url)
+            yield result_dict
+            continue
+        future_resp = session.get(result_dict['url'], timeout=10)
+        resp = future_resp.result()
+        page = BeautifulSoup(resp.content, 'lxml')
+        tags = get_tags_from_parser(page, url, scraper)
+        tags_models = []
+        if tags:
+            for tag in tags:
+                namespace, tag_name = tag
+                tag_model, _ = models.Tag.get_or_create(
+                    name=tag_name, namespace=namespace)
+                models.MatchTagRelationship.get_or_create(
+                    match=result_dict['match_result'], tag=tag_model)
+                tags_models.append(tag_model)
+        else:
+            log.debug('No tags found.')
+        result_dict['tags'] = tags_models
+        yield result_dict
+
+
 def run_program_for_single_img(
         image, resize, size, place, match_filter, write_tags, browser,
-        scraper, disable_tag_print=False
+        scraper, disable_tag_print=False, session=None
 ):
     """Run program for single image."""
     # compatibility
@@ -152,34 +197,56 @@ def run_program_for_single_img(
         result = [x for x in result if x.status == x.STATUS_BEST_MATCH]
 
     MatchTagRelationship = models.MatchTagRelationship
+    use_async = True
+    result_set = []
     for item in result:
         # type item: models.ImageMatch
         # type match_result: models.Match object
+        result_dict = {
+            'image_match': item,
+            'match_result': item.match.match_result,
+            'url': item.match.match_result.link,
+            'tags': [],
+        }
         match_result = item.match.match_result
         url = match_result.link
 
+        mt_rel = MatchTagRelationship.select().where(
+            MatchTagRelationship.match == result_dict['match_result'])
+        tags = [x.tag for x in mt_rel]
+        result_dict['tags'] = tags
+        result_set.append(result_dict)
+
+    new_result_set = []
+    if use_async:
+        new_result_set = list(get_tags_with_async(result_set, br, scraper, session))
+    else:
+        for result_dict in result_set:
+            if not result_dict['tags']:
+                tags = []
+                try:
+                    tags = list([x for x in get_tags(
+                        result_dict['image_match'].match_result, br, scraper)])
+                except requests.exceptions.ConnectionError as e:
+                    log.error(str(e), url=url)
+                result_dict['tags'] = tags
+            new_result_set = result_dict
+
+    for result_dict in new_result_set:
         print('{}|{}|{}'.format(
-            item.similarity, item.status_verbose, url))
+            result_dict['image_match'].similarity,
+            result_dict['image_match'].status_verbose,
+            result_dict['url']
+        ))
 
-        res = MatchTagRelationship.select().where(
-            MatchTagRelationship.match == match_result)
-        tags = [x.tag for x in res]
-
-        if not tags:
-            try:
-                tags = list(
-                    [x for x in get_tags(match_result, br, scraper)])
-            except requests.exceptions.ConnectionError as e:
-                log.error(str(e), url=url)
-
-        tags_verbose = [x.full_name for x in tags]
+        tags_verbose = [x.full_name for x in result_dict['tags']]
         log.debug('{} tag(s) founds'.format(len(tags_verbose)))
-        if tags and not disable_tag_print:
+        if tags_verbose and not disable_tag_print:
             print('\n'.join(tags_verbose))
         else:
             log.debug('No printing tags.')
 
-        if tags and write_tags:
+        if tags_verbose and write_tags:
             with open(tag_textfile, 'a') as f:
                 f.write('\n'.join(tags_verbose))
                 f.write('\n')
@@ -216,6 +283,7 @@ def main(
     br = mechanicalsoup.StatefulBrowser(soup_config={'features': 'lxml'})
     br.raise_on_404 = True
     scraper = cfscrape.CloudflareScraper()
+    session = FuturesSession()
 
     if input_mode == 'folder':
         assert os.path.isdir(prog_input), 'Input is not valid folder'
@@ -230,7 +298,8 @@ def main(
             try:
                 run_program_for_single_img(
                     ff, resize, size, place, match_filter, write_tags,
-                    browser=br, scraper=scraper, disable_tag_print=True
+                    browser=br, scraper=scraper, disable_tag_print=True,
+                    session=session
                 )
             except Exception as e:  # pylint:disable=broad-except
                 err_set.append((ff, e))
@@ -245,5 +314,5 @@ def main(
         image = prog_input
         run_program_for_single_img(
             image, resize, size, place, match_filter, write_tags,
-            browser=br, scraper=scraper
+            browser=br, scraper=scraper, session=session
         )
